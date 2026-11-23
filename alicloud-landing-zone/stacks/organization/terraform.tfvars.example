@@ -1,0 +1,4 @@
+region       = "cn-hangzhou"
+name_prefix  = "mycompany-lz"
+top_level_folders    = ["Security", "SharedServices", "Workloads", "Sandbox"]
+workload_environments = ["dev", "test", "prod"]

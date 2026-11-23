@@ -1,0 +1,8 @@
+region            = "cn-hangzhou"
+name_prefix       = "mycompany-lz"
+audit_bucket_name = "mycompany-lz-audit-globally-unique-12345"
+
+# Before enabling: create a permitted delivery role and check ActionTrail permissions.
+enable_actiontrail             = false
+organization_trail             = false
+actiontrail_oss_write_role_arn = ""

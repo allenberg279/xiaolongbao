@@ -1,0 +1,141 @@
+name: Alibaba Cloud Landing Zone
+
+on:
+  push:
+    paths:
+      - "alicloud-landing-zone/**"
+      - ".github/workflows/alicloud-landing-zone.yml"
+  pull_request:
+    paths:
+      - "alicloud-landing-zone/**"
+      - ".github/workflows/alicloud-landing-zone.yml"
+  workflow_dispatch:
+    inputs:
+      stack:
+        description: "Independent Terraform stack"
+        type: choice
+        required: true
+        options:
+          - organization
+          - network
+          - audit
+      operation:
+        description: "Plan only (default); apply requires explicit approval and enable flag"
+        type: choice
+        required: true
+        default: plan
+        options:
+          - plan
+          - apply
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Terraform format and validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+      - name: Check formatting
+        run: terraform fmt -check -recursive alicloud-landing-zone/stacks
+      - name: Validate all stacks without cloud credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          for stack in organization network audit; do
+            cd "${GITHUB_WORKSPACE}/alicloud-landing-zone/stacks/${stack}"
+            terraform init -backend=false -input=false -no-color
+            terraform validate -no-color
+          done
+
+  deploy:
+    name: Cloud plan or explicitly approved apply
+    # The branch must be the repository default/main branch before allowing cloud operations.
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.operation == 'apply' && 'alicloud-production' || 'alicloud-plan' }}
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: alicloud-landing-zone-${{ inputs.stack }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: alicloud-landing-zone/stacks/${{ inputs.stack }}
+    env:
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "false"
+      TF_VAR_region: ${{ vars.LZ_REGION }}
+      TF_VAR_name_prefix: ${{ vars.LZ_NAME_PREFIX }}
+      TF_VAR_vpc_cidr: ${{ vars.LZ_VPC_CIDR }}
+      TF_VAR_vswitches: ${{ vars.LZ_VSWITCHES_JSON }}
+      TF_VAR_audit_bucket_name: ${{ vars.LZ_AUDIT_BUCKET_NAME }}
+      TF_VAR_enable_actiontrail: ${{ vars.LZ_ENABLE_ACTIONTRAIL }}
+      TF_VAR_actiontrail_oss_write_role_arn: ${{ vars.LZ_TRAIL_OSS_ROLE_ARN }}
+      STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      STATE_REGION: ${{ vars.TF_STATE_REGION }}
+      STATE_OTS_ENDPOINT: ${{ vars.TF_TABLESTORE_ENDPOINT }}
+      STATE_LOCK_TABLE: ${{ vars.TF_LOCK_TABLE }}
+      APPLY_FLAG: ${{ vars.LZ_ENABLE_APPLY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+      - name: Fail closed when production apply is not enabled
+        if: inputs.operation == 'apply'
+        shell: bash
+        run: |
+          if [[ "${APPLY_FLAG}" != "true" ]]; then
+            echo "::error::Set LZ_ENABLE_APPLY=true and configure required reviewers on alicloud-production before applying."
+            exit 1
+          fi
+      - name: Validate required configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          for v in STATE_BUCKET STATE_REGION STATE_OTS_ENDPOINT STATE_LOCK_TABLE TF_VAR_region TF_VAR_name_prefix; do
+            if [[ -z "${!v:-}" ]]; then echo "::error::Missing $v"; exit 1; fi
+          done
+          if [[ "${{ inputs.stack }}" == "audit" && -z "${TF_VAR_audit_bucket_name:-}" ]]; then
+            echo "::error::LZ_AUDIT_BUCKET_NAME must be configured"; exit 1
+          fi
+          if [[ "${{ inputs.stack }}" == "network" && -z "${TF_VAR_vswitches:-}" ]]; then
+            echo "::error::LZ_VSWITCHES_JSON must be configured"; exit 1
+          fi
+          if [[ "${{ inputs.stack }}" == "audit" && "${TF_VAR_enable_actiontrail:-false}" == "true" && -z "${TF_VAR_actiontrail_oss_write_role_arn:-}" ]]; then
+            echo "::error::LZ_TRAIL_OSS_ROLE_ARN is required when ActionTrail is enabled"; exit 1
+          fi
+      - name: Assume narrow Alibaba Cloud role through GitHub OIDC
+        uses: aliyun/configure-aliyun-credentials-action@v1
+        with:
+          oidc-provider-arn: ${{ vars.ALICLOUD_OIDC_PROVIDER_ARN }}
+          role-to-assume: ${{ vars.ALICLOUD_ROLE_ARN }}
+          role-session-name: "github-landing-zone"
+          audience: "sts.aliyuncs.com"
+      - name: Initialize encrypted remote state with OTS locking
+        shell: bash
+        run: |
+          set -euo pipefail
+          terraform init -reconfigure -input=false -no-color \
+            -backend-config="bucket=${STATE_BUCKET}" \
+            -backend-config="region=${STATE_REGION}" \
+            -backend-config="prefix=landing-zone/${{ inputs.stack }}" \
+            -backend-config="key=terraform.tfstate" \
+            -backend-config="encrypt=true" \
+            -backend-config="acl=private" \
+            -backend-config="tablestore_endpoint=${STATE_OTS_ENDPOINT}" \
+            -backend-config="tablestore_table=${STATE_LOCK_TABLE}"
+      - name: Terraform plan
+        shell: bash
+        run: terraform plan -input=false -no-color -out=plan.tfplan
+      - name: Terraform apply (manual + guarded)
+        if: inputs.operation == 'apply'
+        shell: bash
+        run: terraform apply -input=false -no-color -auto-approve plan.tfplan

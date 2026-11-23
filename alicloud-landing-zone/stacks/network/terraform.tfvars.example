@@ -1,0 +1,9 @@
+region      = "cn-hangzhou"
+name_prefix = "mycompany-lz"
+vpc_cidr    = "10.20.0.0/16"
+
+# Example only: verify these zones are actually available in your account.
+vswitches = {
+  private-a = { zone_id = "cn-hangzhou-h", cidr_block = "10.20.1.0/24" }
+  private-b = { zone_id = "cn-hangzhou-i", cidr_block = "10.20.2.0/24" }
+}
